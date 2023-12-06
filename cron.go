@@ -11,12 +11,12 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries   []*Entry
-	chain     Chain
-	stop      chan struct{}
-	add       chan *Entry
-	remove    chan EntryID
-	snapshot  chan chan []Entry
+	entries []*Entry
+	chain   Chain
+	cmd     chan byte
+	add     chan *Entry
+	remove  chan EntryID
+	// snapshot  chan chan []Entry
 	running   bool
 	logger    Logger
 	runningMu sync.Mutex
@@ -25,6 +25,12 @@ type Cron struct {
 	nextID    EntryID
 	jobWaiter sync.WaitGroup
 }
+
+const (
+	Command_Stop byte = iota
+	Command_Wakeup
+	Command_Snapshot
+)
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
 type ScheduleParser interface {
@@ -97,26 +103,26 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
-		entries:   nil,
-		chain:     NewChain(),
-		add:       make(chan *Entry),
-		stop:      make(chan struct{}),
-		snapshot:  make(chan chan []Entry),
+		entries: nil,
+		chain:   NewChain(),
+		add:     make(chan *Entry),
+		cmd:     make(chan byte),
+		// snapshot:  make(chan chan []Entry),
 		remove:    make(chan EntryID),
 		running:   false,
 		runningMu: sync.Mutex{},
@@ -174,13 +180,13 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 }
 
 // Entries returns a snapshot of the cron entries.
-func (c *Cron) Entries() []Entry {
+func (c *Cron) Entries() (entries []Entry) {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	if c.running {
-		replyChan := make(chan []Entry, 1)
-		c.snapshot <- replyChan
-		return <-replyChan
+		c.cmd <- Command_Snapshot
+		entries = c.entrySnapshot()
+		c.cmd <- Command_Wakeup
 	}
 	return c.entrySnapshot()
 }
@@ -283,14 +289,18 @@ func (c *Cron) run() {
 				c.entries = append(c.entries, newEntry)
 				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
 
-			case replyChan := <-c.snapshot:
-				replyChan <- c.entrySnapshot()
-				continue
-
-			case <-c.stop:
-				timer.Stop()
-				c.logger.Info("stop")
-				return
+			case cmd := <-c.cmd:
+				switch cmd {
+				case Command_Stop:
+					timer.Stop()
+					c.logger.Info("stop")
+					return
+				case Command_Wakeup:
+					break
+				case Command_Snapshot:
+					timer.Stop()
+					continue
+				}
 
 			case id := <-c.remove:
 				timer.Stop()
@@ -324,7 +334,7 @@ func (c *Cron) Stop() context.Context {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	if c.running {
-		c.stop <- struct{}{}
+		c.cmd <- Command_Stop
 		c.running = false
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -345,11 +355,11 @@ func (c *Cron) entrySnapshot() []Entry {
 }
 
 func (c *Cron) removeEntry(id EntryID) {
-	var entries []*Entry
+	// var entries []*Entry
 	for _, e := range c.entries {
 		if e.ID != id {
-			entries = append(entries, e)
+			e.Next = time.Time{}
 		}
 	}
-	c.entries = entries
+	// c.entries = entries
 }
